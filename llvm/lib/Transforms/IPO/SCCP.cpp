@@ -91,3 +91,66 @@ INITIALIZE_PASS_END(IPSCCPLegacyPass, "ipsccp",
 
 // createIPSCCPPass - This is the public interface to this file.
 ModulePass *llvm::createIPSCCPPass() { return new IPSCCPLegacyPass(); }
+
+// TODO: Move to new pass manager
+struct FunctionSpecialization : public ModulePass {
+  static char ID; // Pass identification, replacement for typeid
+  bool IsAggressive;
+  FunctionSpecialization(bool _IsAggressive = true)
+      : ModulePass(ID), IsAggressive(_IsAggressive) {}
+
+  void getAnalysisUsage(AnalysisUsage &AU) const override {
+    AU.addRequired<AssumptionCacheTracker>();
+    AU.addRequired<DominatorTreeWrapperPass>();
+    AU.addRequired<TargetLibraryInfoWrapperPass>();
+    AU.addRequired<TargetTransformInfoWrapperPass>();
+  }
+
+  virtual bool runOnModule(Module &M) override {
+    if (skipModule(M))
+      return false;
+
+    const DataLayout &DL = M.getDataLayout();
+    auto GetTLI = [this](Function &F) -> TargetLibraryInfo & {
+      return this->getAnalysis<TargetLibraryInfoWrapperPass>().getTLI(F);
+    };
+    auto GetTTI = [this](Function &F) -> TargetTransformInfo & {
+      return this->getAnalysis<TargetTransformInfoWrapperPass>().getTTI(F);
+    };
+    auto GetAC = [this](Function &F) -> AssumptionCache & {
+      return this->getAnalysis<AssumptionCacheTracker>().getAssumptionCache(F);
+    };
+
+    auto GetAnalysis = [this](Function &F) -> AnalysisResultsForFn {
+      DominatorTree &DT =
+          this->getAnalysis<DominatorTreeWrapperPass>(F).getDomTree();
+      return {
+          std::make_unique<PredicateInfo>(
+              F, DT,
+              this->getAnalysis<AssumptionCacheTracker>().getAssumptionCache(
+                  F)),
+          nullptr,  // We cannot preserve the DT or PDT with the legacy pass
+          nullptr}; // manager, so set them to nullptr.
+    };
+    return runFunctionSpecialization(M, DL, GetTLI, GetTTI, GetAC, GetAnalysis,
+                                     IsAggressive);
+  }
+};
+
+char FunctionSpecialization::ID = 0;
+
+INITIALIZE_PASS_BEGIN(
+    FunctionSpecialization, "function-specialize",
+    "Propagate constant arguments by specializing the function", false, false)
+
+INITIALIZE_PASS_DEPENDENCY(AssumptionCacheTracker)
+INITIALIZE_PASS_DEPENDENCY(DominatorTreeWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(TargetTransformInfoWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(TargetLibraryInfoWrapperPass)
+INITIALIZE_PASS_END(FunctionSpecialization, "function-specialize",
+                    "Propagate constant arguments by specializing the function",
+                    false, false)
+
+ModulePass *llvm::createFunctionSpecializationPass(bool IsAggressive) {
+  return new FunctionSpecialization(IsAggressive);
+}

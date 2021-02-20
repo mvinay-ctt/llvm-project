@@ -22,6 +22,7 @@
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
+#include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Module.h"
@@ -48,6 +49,16 @@ struct AnalysisResultsForFn {
 bool runIPSCCP(Module &M, const DataLayout &DL,
                std::function<const TargetLibraryInfo &(Function &)> GetTLI,
                function_ref<AnalysisResultsForFn(Function &)> getAnalysis);
+
+bool runFunctionSpecialization(
+    Module &M, const DataLayout &DL,
+    std::function<TargetLibraryInfo &(Function &)> GetTLI,
+    std::function<TargetTransformInfo &(Function &)> GetTTI,
+    std::function<AssumptionCache &(Function &)> GetAC,
+    function_ref<AnalysisResultsForFn(Function &)> GetAnalysis,
+    bool IsAggressive);
 } // end namespace llvm
+
+enum FuncSpecializationLevel { Disabled = 0, Enabled, Aggressive };
 
 #endif // LLVM_TRANSFORMS_SCALAR_SCCP_H
