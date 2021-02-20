@@ -27,6 +27,7 @@
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/InitializePasses.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/ManagedStatic.h"
 #include "llvm/Transforms/AggressiveInstCombine/AggressiveInstCombine.h"
@@ -42,6 +43,7 @@
 #include "llvm/Transforms/Scalar/InstSimplifyPass.h"
 #include "llvm/Transforms/Scalar/LICM.h"
 #include "llvm/Transforms/Scalar/LoopUnrollPass.h"
+#include "llvm/Transforms/Scalar/SCCP.h"
 #include "llvm/Transforms/Scalar/SimpleLoopUnswitch.h"
 #include "llvm/Transforms/Utils.h"
 #include "llvm/Transforms/Vectorize.h"
@@ -164,6 +166,17 @@ cl::opt<bool> EnableConstraintElimination(
     "enable-constraint-elimination", cl::init(false), cl::Hidden,
     cl::desc(
         "Enable pass to eliminate conditions based on linear constraints."));
+
+static cl::opt<FuncSpecializationLevel> FunctionSpecializationLevel(
+    "function-specialize-level", cl::init(FuncSpecializationLevel::Disabled),
+    cl::Hidden, cl::desc("Enable Function Specialization LTO pass"),
+    cl::values(clEnumValN(FuncSpecializationLevel::Disabled, "disable",
+                          "Disable Function specialization"),
+               clEnumValN(FuncSpecializationLevel::Enabled, "enable",
+                          "Enable Function Specialization"),
+               clEnumValN(FuncSpecializationLevel::Aggressive, "aggressive",
+                          "Aggressively run function specialization (for "
+                          "recursive functions)")));
 
 cl::opt<AttributorRunOption> AttributorRun(
     "attributor-enable", cl::Hidden, cl::init(AttributorRunOption::NONE),
@@ -951,6 +964,11 @@ void PassManagerBuilder::addLTOOptimizationPasses(legacy::PassManagerBase &PM) {
     // produce the same result as if we only do promotion here.
     PM.add(
         createPGOIndirectCallPromotionLegacyPass(true, !PGOSampleUse.empty()));
+
+    // Propage constant function arguments by specializing the functions.
+    if (FunctionSpecializationLevel > 0)
+      PM.add(createFunctionSpecializationPass(
+          FunctionSpecializationLevel == FuncSpecializationLevel::Aggressive));
 
     // Propagate constants at call sites into the functions they call.  This
     // opens opportunities for globalopt (and inlining) by substituting function

@@ -27,11 +27,16 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
+#include "llvm/Analysis/AssumptionCache.h"
+#include "llvm/Analysis/CodeMetrics.h"
 #include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/Analysis/DomTreeUpdater.h"
 #include "llvm/Analysis/GlobalsModRef.h"
+#include "llvm/Analysis/InlineCost.h"
 #include "llvm/Analysis/InstructionSimplify.h"
+#include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
+#include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/Analysis/ValueLattice.h"
 #include "llvm/Analysis/ValueLatticeUtils.h"
 #include "llvm/Analysis/ValueTracking.h"
@@ -58,9 +63,14 @@
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Transforms/Utils/PredicateInfo.h"
+#include "llvm/Transforms/Utils/SizeOpts.h"
+#include "llvm/Transforms/Utils/ValueMapper.h"
+#include <bits/stdint-uintn.h>
 #include <cassert>
+#include <limits>
 #include <utility>
 #include <vector>
 
@@ -79,10 +89,17 @@ STATISTIC(IPNumGlobalConst, "Number of globals found to be constant by IPSCCP");
 STATISTIC(
     IPNumInstReplaced,
     "Number of instructions replaced with (simpler) instruction by IPSCCP");
+STATISTIC(NumFuncSpecialized, "Number of Functions Specialized");
 
 // The maximum number of range extensions allowed for operations requiring
 // widening.
 static const unsigned MaxNumRangeExtensions = 10;
+
+// THe maximum number of clones allowed for a single function specialization:
+static const unsigned MaxConstantsThreshold = 3;
+
+// Assuming the average loop iteration count.
+static const unsigned AvgLoopIterationCount = 10;
 
 /// Returns MergeOptions with MaxWidenSteps set to MaxNumRangeExtensions.
 static ValueLatticeElement::MergeOptions getMaxWidenStepsOpts() {
@@ -210,6 +227,14 @@ public:
     return true;
   }
 
+  /// Mark all of the blocks in function \p F non-executable. Clients can used
+  /// this method to erase a function from the module (e.g., if it has been
+  /// completely specialized and is no longer needed).
+  void markFunctionUnreachable(Function *F) {
+    for (auto &BB : *F)
+      BBExecutable.erase(&BB);
+  }
+
   /// TrackValueOfGlobalVariable - Clients can use this method to
   /// inform the SCCPSolver that it should track loads and stores to the
   /// specified global variable if it can.  This is only legal to call if
@@ -255,6 +280,11 @@ public:
   /// argument-tracked functions.
   bool isArgumentTrackedFunction(Function *F) {
     return TrackingIncomingArguments.count(F);
+  }
+
+  /// Return a reference to the set of argument tracked functions.
+  SmallPtrSetImpl<Function *> &getArgumentTrackedFunctions() {
+    return TrackingIncomingArguments;
   }
 
   /// Solve - Solve for constants and executable blocks.
@@ -324,6 +354,28 @@ public:
         markOverdefined(getStructValueState(V, i), V);
     else
       markOverdefined(ValueState[V], V);
+  }
+
+  /// Mark argument \p A constant with value \p C in a new function
+  /// specialization. The argument's parent function is a specialization of the
+  /// original function \p F. All other arguments of the specialization inherit
+  /// the lattice state of their corresponding values in the original function.
+  void markArgInFuncSpecialization(Function *F, Argument *A, Constant *C) {
+    assert(F->arg_size() == A->getParent()->arg_size() &&
+           "Functions should have the same number of arguments");
+
+    // Mark the argument constant in the new function.
+    markConstant(A, C);
+
+    // For the remaining arguments in the new function, copy the lattice state
+    // over from the old function.
+    for (auto I = F->arg_begin(), J = A->getParent()->arg_begin(),
+              E = F->arg_end();
+         I != E; ++I, ++J)
+      if (J != A && ValueState.count(I)) {
+        ValueState[J] = ValueState[I];
+        pushToWorkList(ValueState[J], J);
+      }
   }
 
   // isStructLatticeConstant - Return true if all the lattice values
@@ -2182,4 +2234,683 @@ bool llvm::runIPSCCP(
   }
 
   return MadeChanges;
+}
+
+class FunctionSpecializer {
+
+  /// The IPSCCP Solver.
+  SCCPSolver &Solver;
+
+  /// Analyses used to help determine if a function should be specialized.
+  std::function<AssumptionCache &(Function &)> GetAC;
+  std::function<TargetTransformInfo &(Function &)> GetTTI;
+  std::function<TargetLibraryInfo &(Function &)> GetTLI;
+
+  SmallPtrSet<Function *, 2> SpecializedFuncs;
+
+public:
+  FunctionSpecializer(SCCPSolver &Solver,
+                      std::function<AssumptionCache &(Function &)> GetAC,
+                      std::function<TargetTransformInfo &(Function &)> GetTTI,
+                      std::function<TargetLibraryInfo &(Function &)> GetTLI)
+      : Solver(Solver), GetAC(GetAC), GetTTI(GetTTI), GetTLI(GetTLI) {}
+
+  /// Attempt to specialize functions in the module to enable constant
+  /// propagation across function boundaries.
+  ///
+  /// \returns true if at least one function is specialized.
+  bool
+  specializeFunctions(SmallVectorImpl<Function *> &WorkList,
+                      SmallVectorImpl<Function *> &CurrentSpecializations) {
+
+    // Attempt to specialize the argument-tracked functions.
+    bool Changed = false;
+    for (auto *F : WorkList) {
+      Changed |= specializeFunction(F, CurrentSpecializations);
+    }
+
+    for (auto *SpecializedFunc : CurrentSpecializations) {
+
+      SpecializedFuncs.insert(SpecializedFunc);
+
+      // Initialize the state of the newly created functions, marking them
+      // argument-tracked and executable.
+      if (SpecializedFunc->hasExactDefinition() &&
+          !SpecializedFunc->hasFnAttribute(Attribute::Naked))
+        Solver.AddTrackedFunction(SpecializedFunc);
+      Solver.AddArgumentTrackedFunction(SpecializedFunc);
+      WorkList.push_back(SpecializedFunc);
+      Solver.MarkBlockExecutable(&SpecializedFunc->front());
+
+      // Replace the function arguments for the specialized functions.
+      for (Argument &Arg : SpecializedFunc->args()) {
+        if (!Arg.use_empty() && tryToReplaceWithConstant(&Arg)) {
+          LLVM_DEBUG(dbgs()
+                     << "\nFunctionSpecialize: Replaced constant argument");
+        }
+      }
+    }
+    return Changed;
+  }
+
+  bool tryToReplaceWithConstant(Value *V) {
+
+    if (!V->getType()->isSingleValueType() || isa<CallBase>(V) ||
+        V->user_empty()) {
+      return false;
+    }
+
+    const ValueLatticeElement &IV = Solver.getLatticeValueFor(V);
+    if (isOverdefined(IV))
+      return false;
+    auto *Const =
+        isConstant(IV) ? Solver.getConstant(IV) : UndefValue::get(V->getType());
+    V->replaceAllUsesWith(Const);
+    for (auto *U : Const->users()) {
+      if (auto *I = dyn_cast<Instruction>(U)) {
+        if (Solver.isBlockExecutable(I->getParent()))
+          Solver.visit(I);
+      }
+    }
+
+    // Remove the instruction from Block and Solver.
+    if (auto *I = dyn_cast<Instruction>(V)) {
+      if (I->isSafeToRemove()) {
+        I->eraseFromParent();
+        Solver.removeLatticeValueFor(I);
+      }
+    }
+    return true;
+  }
+
+private:
+  /// Clone the function \p F and remove the ssa_copy intrinsics added by
+  /// the SCCPSolver in the cloned version.
+  Function *cloneCandidateFunction(Function *F) {
+    ValueToValueMapTy EmptyMap;
+    Function *Clone = CloneFunction(F, EmptyMap);
+    // The ssa_copy intrinsics are added to the original function by
+    // the SCCP utility. Remove them for the cloned version.
+    for (BasicBlock &BB : *Clone) {
+      for (auto BI = BB.begin(), E = BB.end(); BI != E;) {
+        auto *Inst = &*BI++;
+        if (auto *II = dyn_cast<IntrinsicInst>(Inst)) {
+          if (II->getIntrinsicID() == Intrinsic::ssa_copy) {
+            Value *Op = II->getOperand(0);
+            Inst->replaceAllUsesWith(Op);
+            Inst->eraseFromParent();
+          }
+        }
+      }
+    }
+    return Clone;
+  }
+
+  /// Attempt to specialize function \p F.
+  ///
+  /// This function decides whether to specialize function \p F based on the
+  /// known constant values its arguments can take on. Specialization is
+  /// performed on the first interesting argument. Specializations based on
+  /// additional arguments will be evaluated on following iterations of the
+  /// main IPSCCP solve loop.
+  ///
+  /// \returns true if the function is specialized.
+  bool specializeFunction(Function *F,
+                          SmallVectorImpl<Function *> &Specializations) {
+
+    // Do not specialize the cloned function again.
+    if (SpecializedFuncs.contains(F)) {
+      return false;
+    }
+
+    // If we're optimizing the function for size, we shouldn't specialize it.
+    if (F->hasOptSize() ||
+        llvm::shouldOptimizeForSize(F, nullptr, nullptr, PGSOQueryType::IRPass))
+      return false;
+
+    // Exit if the function is not executable. There's no point in specializing
+    // a dead function.
+    if (!Solver.isBlockExecutable(&F->getEntryBlock()))
+      return false;
+
+    // Determine if we should specialize the function based on the values the
+    // argument can take on. If specialization is not profitable, we continue
+    // on to the next argument.
+    for (Argument &A : F->args()) {
+
+      // True if this will be a partial specialization. We will need to keep
+      // the original function around in addition to the added specializations.
+      bool IsPartial = true;
+
+      // Determine if this argument is interesting. If we know the argument can
+      // take on any constant values, they are collected in Constants. If the
+      // argument can only ever equal a constant value in Constants, the
+      // function will be completely specialized, and the IsPartial flag will
+      // be set to false by isArgumentInteresting (that function only adds
+      // values to the Constants list that are deemed profitable).
+      SmallVector<Constant *, 4> Constants;
+      if (!isArgumentInteresting(&A, Constants, IsPartial))
+        continue;
+
+      assert(!Constants.empty() && "No constants on which to specialize");
+      LLVM_DEBUG(dbgs() << "Specializing function " << F->getName() << " on "
+                        << A << ": (" << *Constants[0];
+                 for (unsigned I = 1; I < Constants.size(); ++I) dbgs()
+                 << ", " << *Constants[I];
+                 dbgs() << ")\n");
+
+      // Create a version of the function in which the argument is marked
+      // constant with the given value.
+      for (auto *C : Constants) {
+
+        // Clone the function. We leave the ValueToValueMap empty to allow
+        // IPSCCP to propagate the constant arguments.
+        Function *Clone = cloneCandidateFunction(F);
+        Argument *ClonedArg = Clone->arg_begin() + A.getArgNo();
+
+        // Rewrite calls to the function so that they call the clone instead.
+        rewriteCallSites(F, Clone, *ClonedArg, C);
+
+        // Initialize the lattice state of the arguments of the function clone,
+        // marking the argument on which we specialized the function constant
+        // with the given value.
+        Solver.markArgInFuncSpecialization(F, ClonedArg, C);
+
+        // Mark all the specialized functions
+        Specializations.push_back(Clone);
+        NumFuncSpecialized++;
+      }
+
+      // If the function has been completely specialized, the original function
+      // is no longer needed. Mark it unreachable.
+      if (!IsPartial)
+        Solver.markFunctionUnreachable(F);
+
+      // Only one argument per function.
+      return true;
+    }
+
+    return false;
+  }
+
+  /// Compute the cost of specializing function \p F.
+  uint64_t getSpecializationCost(Function *F) {
+    // Compute the code metrics for the function.
+    SmallPtrSet<const Value *, 32> EphValues;
+    CodeMetrics::collectEphemeralValues(F, &(GetAC)(*F), EphValues);
+    CodeMetrics Metrics;
+    for (BasicBlock &BB : *F)
+      Metrics.analyzeBasicBlock(&BB, (GetTTI)(*F), EphValues);
+
+    // If the code metrics reveal that we shouldn't duplicate the function, we
+    // shouldn't specialize it. Set the specialization cost to the maximum.
+    if (Metrics.notDuplicatable)
+      return std::numeric_limits<unsigned>::max();
+
+    // Otherwise, set the specialization cost to be the cost of all the
+    // instructions in the function and penalty for specializing more functions.
+    unsigned Penalty = (NumFuncSpecialized + 1);
+    return Metrics.NumInsts * InlineConstants::InstrCost * Penalty;
+  }
+
+  uint64_t getUserBonus(User *U, llvm::TargetTransformInfo &TTI, LoopInfo &LI) {
+    auto *I = dyn_cast_or_null<Instruction>(U);
+    // If not an instruction we do not know how to evaluate.
+    // Keep minimum possible cost for now so that it doesnt affect
+    // specialization.
+    if (!I) {
+      return std::numeric_limits<unsigned>::min();
+    }
+    uint64_t Cost = TTI.getUserCost(U, TargetTransformInfo::TCK_SizeAndLatency);
+
+    // Traverse recursively if there are more uses.
+    // TODO: Any other instructions to be added here?
+    if (I->mayReadFromMemory() || I->isCast()) {
+      for (auto *user : I->users()) {
+        Cost += getUserBonus(user, TTI, LI);
+      }
+    }
+
+    // Increase the cost if it is inside the loop.
+    auto LoopDepth = LI.getLoopDepth(I->getParent()) + 1;
+    Cost *= AvgLoopIterationCount ^ LoopDepth;
+    return Cost;
+  }
+
+  /// Compute a bonus for replacing argument \p A with constant \p C.
+  unsigned getSpecializationBonus(Argument *A, Constant *C) {
+    Function *F = A->getParent();
+    DominatorTree DT(*F);
+    LoopInfo LI(DT);
+    auto &TTI = (GetTTI)(*F);
+
+    unsigned TotalCost = 0;
+    for (auto *U : A->users()) {
+      TotalCost += getUserBonus(U, TTI, LI);
+    }
+
+    // The below heuristic is only concerned with exposing inlining
+    // opportunities via indirect call promotion. If the argument is not a
+    // function pointer, give up.
+    if (!isa<PointerType>(A->getType()) ||
+        !isa<FunctionType>(A->getType()->getPointerElementType()))
+      return TotalCost;
+
+    // Since the argument is a function pointer, its incoming constant values
+    // should be functions or constant expressions. The code below attempts to
+    // look through cast expressions to find the function that will be called.
+    Value *CalledValue = C;
+    while (isa<ConstantExpr>(CalledValue) &&
+           cast<ConstantExpr>(CalledValue)->isCast())
+      CalledValue = cast<User>(CalledValue)->getOperand(0);
+    Function *CalledFunction = dyn_cast<Function>(CalledValue);
+    if (!CalledFunction)
+      return TotalCost;
+
+    // Get TTI for the called function (used for the inline cost).
+    auto &CalleeTTI = (GetTTI)(*CalledFunction);
+
+    // Look at all the call sites whose called value is the argument.
+    // Specializing the function on the argument would allow these indirect
+    // calls to be promoted to direct calls. If the indirect call promotion
+    // would likely enable the called function to be inlined, specializing is a
+    // good idea.
+    int Bonus = 0;
+    for (User *U : A->users()) {
+      if (!isa<CallInst>(U) && !isa<InvokeInst>(U))
+        continue;
+      auto *CS = cast<CallBase>(U);
+      if (CS->getCalledOperand() != A)
+        continue;
+
+      // Get the cost of inlining the called function at this call site. Note
+      // that this is only an estimate. The called function may eventually
+      // change in a way that leads to it not being inlined here, even though
+      // inlining looks profitable now. For example, one of its called
+      // functions may be inlined into it, making the called function too large
+      // to be inlined into this call site.
+      //
+      // We apply a boost for performing indirect call promotion by increasing
+      // the default threshold by the threshold for indirect calls.
+      auto Params = getInlineParams();
+      Params.DefaultThreshold += InlineConstants::IndirectCallThreshold;
+      InlineCost IC =
+          getInlineCost(*CS, CalledFunction, Params, CalleeTTI, GetAC, GetTLI);
+
+      // We clamp the bonus for this call to be between zero and the default
+      // threshold.
+      if (IC.isAlways())
+        Bonus += Params.DefaultThreshold;
+      else if (IC.isVariable() && IC.getCostDelta() > 0)
+        Bonus += IC.getCostDelta();
+    }
+
+    return TotalCost + Bonus;
+  }
+
+  /// Determine if we should specialize a function based on the incoming values
+  /// of the given argument.
+  ///
+  /// This function implements the goal-directed heuristic. It determines if
+  /// specializing the function based on the incoming values of argument \p A
+  /// would result in any significant optimization opportunities. If
+  /// optimization opportunities exist, the constant values of \p A on which to
+  /// specialize the function are collected in \p Constants. If the values in
+  /// \p Constants represent the complete set of values that \p A can take on,
+  /// the function will be completely specialized, and the \p IsPartial flag is
+  /// set to false.
+  ///
+  /// \returns true if the function should be specialized on the given
+  /// argument.
+  bool isArgumentInteresting(Argument *A,
+                             SmallVectorImpl<Constant *> &Constants,
+                             bool &IsPartial) {
+    Function *F = A->getParent();
+
+    // For now, don't attempt to specialize functions based on the values of
+    // composite types.
+    if (!A->getType()->isSingleValueType() || A->user_empty())
+      return false;
+
+    // If the argument isn't overdefined, there's nothing to do. It should
+    // already be constant.
+    if (!Solver.getLatticeValueFor(A).isOverdefined())
+      return false;
+
+    // Collect the constant values that the argument can take on. If the
+    // argument can't take on any constant values, we aren't going to
+    // specialize the function. While it's possible to specialize the function
+    // based on non-constant arguments, there's likely not much benefit to
+    // constant propagation in doing so.
+    SmallVector<Constant *, 4> PossibleConstants;
+    bool AllConstant = getPossibleConstants(A, PossibleConstants);
+    if (PossibleConstants.empty() ||
+        PossibleConstants.size() > MaxConstantsThreshold)
+      return false;
+
+    // Determine if it would be profitable to create a specialization of the
+    // function where the argument takes on the given constant value. If so,
+    // add the constant to Constants.
+    for (auto *C : PossibleConstants) {
+      if (getSpecializationBonus(A, C) > getSpecializationCost(F))
+        Constants.push_back(C);
+    }
+
+    // None of the constant values the argument can take on were deemed good
+    // candidates on which to specialize the function.
+    if (Constants.empty())
+      return false;
+
+    // This will be a partial specialization if some of the constants were
+    // rejected due to their profitability.
+    IsPartial = !AllConstant || PossibleConstants.size() != Constants.size();
+
+    return true;
+  }
+
+  /// Collect in \p Constants all the constant values that argument \p A can
+  /// take on.
+  ///
+  /// \returns true if all of the values the argument can take on are constant
+  /// (e.g., the argument's parent function cannot be called with an
+  /// overdefined value).
+  bool getPossibleConstants(Argument *A,
+                            SmallVectorImpl<Constant *> &Constants) {
+    Function *F = A->getParent();
+    bool AllConstant = true;
+
+    // Iterate over all the call sites of the argument's parent function.
+    for (User *U : F->users()) {
+      if (!isa<CallInst>(U) && !isa<InvokeInst>(U))
+        continue;
+      auto &CS = *cast<CallBase>(U);
+
+      // If the parent of the call site will never be executed, we don't need
+      // to worry about the passed value.
+      if (!Solver.isBlockExecutable(CS.getParent()))
+        continue;
+
+      auto *V = CS.getArgOperand(A->getArgNo());
+      // TrackValueOfGlobalVariable only tracks scalar global variables.
+      if (auto *GV = dyn_cast<GlobalVariable>(V)) {
+        if (!GV->getValueType()->isSingleValueType()) {
+          return false;
+        }
+      }
+
+      // Get the lattice value for the value the call site passes to the
+      // argument. If this value is not constant, move on to the next call
+      // site. Additionally, set the AllConstant flag to false.
+      if (V != A && !Solver.getLatticeValueFor(V).isConstant()) {
+        AllConstant = false;
+        continue;
+      }
+
+      // Add the constant to the set.
+      if (auto *C = dyn_cast<Constant>(CS.getArgOperand(A->getArgNo())))
+        Constants.push_back(C);
+    }
+
+    // If the argument can only take on constant values, AllConstant will be
+    // true.
+    return AllConstant;
+  }
+
+  /// Rewrite calls to function \p F to call function \p Clone instead.
+  ///
+  /// This function modifies calls to function \p F whose argument at index \p
+  /// ArgNo is equal to constant \p C. The calls are rewritten to call function
+  /// \p Clone instead.
+  void rewriteCallSites(Function *F, Function *Clone, Argument &Arg,
+                        Constant *C) {
+    unsigned ArgNo = Arg.getArgNo();
+    SmallVector<CallBase *, 4> CallSitesToRewrite;
+    for (auto *U : F->users()) {
+      if (!isa<CallInst>(U) && !isa<InvokeInst>(U))
+        continue;
+      auto &CS = *cast<CallBase>(U);
+      if (!CS.getCalledFunction() || CS.getCalledFunction() != F)
+        continue;
+      CallSitesToRewrite.push_back(&CS);
+    }
+    for (auto *CS : CallSitesToRewrite) {
+
+      if ((CS->getFunction() == Clone && CS->getArgOperand(ArgNo) == &Arg) ||
+          CS->getArgOperand(ArgNo) == C) {
+        CS->setCalledFunction(Clone);
+        Solver.markOverdefined(CS);
+      }
+    }
+  }
+};
+
+/// Function to clean up the left over intrinsics from SCCP util.
+static void cleanup(Module &M) {
+  for (Function &F : M) {
+    for (BasicBlock &BB : F) {
+      for (BasicBlock::iterator BI = BB.begin(), E = BB.end(); BI != E;) {
+        Instruction *Inst = &*BI++;
+        if (auto *II = dyn_cast<IntrinsicInst>(Inst)) {
+          if (II->getIntrinsicID() == Intrinsic::ssa_copy) {
+            Value *Op = II->getOperand(0);
+            Inst->replaceAllUsesWith(Op);
+            Inst->eraseFromParent();
+          }
+        }
+      }
+    }
+  }
+}
+
+/// This function,
+/// 1. Returns \p Val if it is constant
+/// 2. Checks if \p Val is AllocaInst and returns single constant value stored
+/// to it.
+static Constant *getConstantValue(CallInst *Call, Value *Val,
+                                  SCCPSolver &Solver) {
+  if (!Val)
+    return nullptr;
+  Val = Val->stripPointerCasts();
+  if (auto *ConstVal = dyn_cast<ConstantInt>(Val)) {
+    return ConstVal;
+  }
+  auto *Alloca = dyn_cast<AllocaInst>(Val);
+  if (!Alloca)
+    return nullptr;
+
+  if (!Alloca->getAllocatedType()->isIntegerTy()) {
+    return nullptr;
+  }
+
+  // Check if alloca is promotable..
+  // NOTE: isAllocaPromotable() would fail because of usage in the CallInst.
+  Value *StoreValue = nullptr;
+  for (auto *User : Alloca->users()) {
+    if (User == Call)
+      continue;
+    if (auto *Bitcast = dyn_cast<BitCastInst>(User)) {
+      if (!Bitcast->hasOneUse() || *Bitcast->user_begin() != Call) {
+        return nullptr;
+      }
+      continue;
+    }
+
+    if (auto *Store = dyn_cast<StoreInst>(User)) {
+      // This is a duplicate store, bail out.
+      if (StoreValue || Store->isVolatile()) {
+        return nullptr;
+      }
+      StoreValue = Store->getValueOperand();
+      continue;
+    }
+    // Return null, if there is any other unknown usage.
+    return nullptr;
+  }
+
+  return dyn_cast_or_null<Constant>(StoreValue);
+}
+
+// This function does the following tansformation:
+// Before:
+// define internal void @someFunc(i32* arg1) {
+//  %temp = alloca i32, align 4
+//  store i32 2 i32* %temp, align 4
+//  call void @otherFunc(i32* nonnull %temp)
+//  ret void
+// }
+//
+// define internal void @otherFunc(i32* nocapture readonly %arg)
+//
+//
+// After:
+// @funciton.specialize.arg = internal constant i32  ; Global constant
+// define internal void @someFunc(i32* arg1) {
+//  call void @otherFunc(i32* nonnull @funciton.specialize.arg)
+//  ret void
+// }
+//
+// define internal void @otherFunc(i32* nocapture readonly %arg)
+// FIXME: Is there a better way to do this transformation?
+static void
+tryToReplaceConstantArgOperand(SmallVectorImpl<Function *> &WorkList, Module &M,
+                               SCCPSolver &Solver) {
+
+  // Iterate over the argument tracked functions see if there
+  // are any new constant values for the call instruction via
+  // stack variables.
+  for (auto *F : WorkList) {
+    // TODO: Generalize for any read only arguments.
+    if (F->arg_size() != 1) {
+      continue;
+    }
+
+    auto &Arg = *F->arg_begin();
+    if (!Arg.onlyReadsMemory() || !Arg.getType()->isPointerTy()) {
+      continue;
+    }
+
+    for (auto *User : F->users()) {
+      auto *Call = dyn_cast<CallInst>(User);
+      if (!Call)
+        break;
+      auto *ArgOperand = Call->getArgOperand(0);
+      auto *ArgOpType = ArgOperand->getType();
+      auto *ConstVal = getConstantValue(Call, ArgOperand, Solver);
+      if (!ConstVal)
+        break;
+
+      Value *GV = new GlobalVariable(M, ConstVal->getType(), true,
+                                     GlobalValue::InternalLinkage, ConstVal,
+                                     "funciton.specialize.arg");
+      if (ArgOpType != ConstVal->getType()) {
+        GV =
+            ConstantExpr::getBitCast(cast<Constant>(GV), ArgOperand->getType());
+      }
+      Call->setArgOperand(0, GV);
+
+      // Add the changed CallInst to Solver Worklist
+      Solver.visitCall(*Call);
+    }
+  }
+}
+
+bool llvm::runFunctionSpecialization(
+    Module &M, const DataLayout &DL,
+    std::function<TargetLibraryInfo &(Function &)> GetTLI,
+    std::function<TargetTransformInfo &(Function &)> GetTTI,
+    std::function<AssumptionCache &(Function &)> GetAC,
+    function_ref<AnalysisResultsForFn(Function &)> GetAnalysis,
+    bool IsAggressive) {
+  SCCPSolver Solver(DL, GetTLI, M.getContext());
+  FunctionSpecializer FS(Solver, GetAC, GetTTI, GetTLI);
+  bool Changed = false;
+
+  // Loop over all functions, marking arguments to those with their addresses
+  // taken or that are external as overdefined.
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+
+    Solver.addAnalysis(F, GetAnalysis(F));
+
+    // Determine if we can track the function's arguments. If so, add the
+    // function to the solver's set of argument-tracked functions.
+    if (canTrackArgumentsInterprocedurally(&F)) {
+      Solver.AddArgumentTrackedFunction(&F);
+      continue;
+    }
+
+    // Assume the function is called.
+    Solver.MarkBlockExecutable(&F.front());
+
+    // Assume nothing about the incoming arguments.
+    for (Argument &AI : F.args())
+      Solver.markOverdefined(&AI);
+  }
+
+  // Determine if we can track any of the module's global variables. If so, add
+  // the global variables we can track to the solver's set of tracked global
+  // variables.
+  for (GlobalVariable &G : M.globals()) {
+    G.removeDeadConstantUsers();
+    if (canTrackGlobalVariableInterprocedurally(&G))
+      Solver.TrackValueOfGlobalVariable(&G);
+  }
+
+  // Solve for constants.
+  auto RunSCCPSolver = [&](auto &WorkList) {
+    bool ResolvedUndefs = true;
+    Solver.Solve();
+    while (ResolvedUndefs) {
+      LLVM_DEBUG(dbgs() << "FunctionSpecialize: RESOLVING UNDEFS\n");
+      ResolvedUndefs = false;
+      for (Function *F : WorkList) {
+        if (Solver.ResolvedUndefsIn(*F))
+          ResolvedUndefs = true;
+      }
+      if (ResolvedUndefs)
+        Solver.Solve();
+    }
+
+    for (auto *F : WorkList) {
+      for (BasicBlock &BB : *F) {
+        if (!Solver.isBlockExecutable(&BB)) {
+          continue;
+        }
+        for (auto &I : make_early_inc_range(BB)) {
+          FS.tryToReplaceWithConstant(&I);
+        }
+      }
+    }
+  };
+
+  auto &TrackedFuncs = Solver.getArgumentTrackedFunctions();
+  SmallVector<Function *, 16> WorkList(TrackedFuncs.begin(),
+                                       TrackedFuncs.end());
+
+  // Initially resolve the constants in all the argument tracked functions.
+  RunSCCPSolver(WorkList);
+
+  SmallVector<Function *, 2> CurrentSpecializations;
+  // Iterate if there are more specializations.
+  while (FS.specializeFunctions(WorkList, CurrentSpecializations)) {
+    Changed = true;
+
+    // Run solver for the specialized functions only.
+    RunSCCPSolver(CurrentSpecializations);
+
+    // Replace some unresolved constant arguments
+    tryToReplaceConstantArgOperand(WorkList, M, Solver);
+
+    CurrentSpecializations.clear();
+
+    // Run only one iteration if the aggresive flag is not on.
+    if (!IsAggressive)
+      break;
+  }
+
+  // Clean up the IR by removing ssa_copy intrinsics.
+  cleanup(M);
+
+  return Changed;
 }
